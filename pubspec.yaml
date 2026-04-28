@@ -1,0 +1,26 @@
+name: mcp_io
+description: Universal I/O Backbone for device integration into the MCP ecosystem. Provides device registry, policy engine, audit trail, streaming, command queue, and session management.
+version: 0.1.0
+homepage: https://app-appplayer.github.io/makemind
+repository: https://github.com/app-appplayer/mcp_io
+issue_tracker: https://github.com/app-appplayer/mcp_io/issues
+
+topics:
+  - io
+  - mcp
+  - device
+  - registry
+  - streaming
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  mcp_bundle: ^0.3.0
+  meta: ^1.15.0
+  collection: ^1.19.1
+  uuid: ^4.0.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.24.0
