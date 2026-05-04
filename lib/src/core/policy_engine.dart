@@ -57,12 +57,28 @@ class _PendingPlan {
     required this.planResult,
     required this.command,
     required this.actor,
+    this.adapter,
   });
 
   final PlanResult planResult;
   final Command command;
   final ActorContext actor;
+
+  /// Adapter captured at plan time so that `commitExecute` does not
+  /// require the caller to re-resolve it.
+  final IoDevicePort? adapter;
 }
+
+/// Function that evaluates an interlock rule against live device state.
+///
+/// Returns `true` when the interlock condition is satisfied (i.e. the
+/// configured `action` should be applied — typically `deny`).
+/// Returns `false` when the condition is not met, so execution may proceed.
+///
+/// IoRuntime is the canonical provider — it reads the interlock URI via
+/// the adapter responsible for that resource and compares against the
+/// condition operator.
+typedef InterlockEvaluator = Future<bool> Function(Interlock interlock);
 
 /// 6-stage policy evaluation engine.
 ///
@@ -116,10 +132,16 @@ class PolicyEngine {
   ///
   /// Returns a [PolicyDecision] indicating whether the command is
   /// allowed, denied, needs approval, or needs a plan.
+  ///
+  /// When [interlockEvaluator] is provided, Stage 5 reads the live device
+  /// state through the evaluator and decides allow vs deny. When omitted,
+  /// the engine falls back to the legacy behaviour of returning
+  /// `needsApproval` so that the caller can perform out-of-band checks.
   Future<PolicyDecision> evaluate({
     required Command command,
     required ActorContext actor,
     required DeviceDescriptor device,
+    InterlockEvaluator? interlockEvaluator,
   }) async {
     final now = _clock();
     final conditions = <ConditionEvaluation>[];
@@ -218,19 +240,34 @@ class PolicyEngine {
       tracker.record(now);
     }
 
-    // Stage 5: Interlock Evaluation (simplified — full impl needs device read)
+    // Stage 5: Interlock Evaluation
     if (constraints.interlocks != null) {
       for (final interlock in constraints.interlocks!) {
-        // Interlocks require actual device state reads.
-        // This is a simplified check — IoRuntime provides
-        // full interlock evaluation with device access.
-        if (interlock.action == InterlockAction.deny) {
-          // Mark as needing runtime interlock evaluation
-          return PolicyDecision(
-            decision: Decision.needsApproval,
-            ruleId: matchedRule.id,
-            notes: 'Interlock check required for ${interlock.uri}',
-          );
+        if (interlockEvaluator != null) {
+          final triggered = await interlockEvaluator(interlock);
+          if (triggered) {
+            if (interlock.action == InterlockAction.deny) {
+              return PolicyDecision(
+                decision: Decision.deny,
+                ruleId: matchedRule.id,
+                notes: 'Interlock blocked: ${interlock.uri} '
+                    '(${interlock.condition.name})',
+              );
+            }
+            // InterlockAction.warn: condition met but execution allowed.
+            // Trace is captured in PolicyDecision.notes for audit purposes.
+            // Continue evaluating remaining interlocks.
+          }
+        } else {
+          // No evaluator wired — fall back to legacy behaviour so that
+          // out-of-band approval flows still work.
+          if (interlock.action == InterlockAction.deny) {
+            return PolicyDecision(
+              decision: Decision.needsApproval,
+              ruleId: matchedRule.id,
+              notes: 'Interlock check required for ${interlock.uri}',
+            );
+          }
         }
       }
     }
@@ -254,15 +291,21 @@ class PolicyEngine {
   /// Plan evaluation (dry-run).
   ///
   /// Performs normal evaluation and stores a pending plan with expiry.
+  /// When [adapter] is supplied it is captured in the pending plan so
+  /// that `commitExecute` can route to the same adapter without the
+  /// caller re-resolving it.
   Future<PlanResult> planEvaluate({
     required Command command,
     required ActorContext actor,
     required DeviceDescriptor device,
+    InterlockEvaluator? interlockEvaluator,
+    IoDevicePort? adapter,
   }) async {
     final decision = await evaluate(
       command: command,
       actor: actor,
       device: device,
+      interlockEvaluator: interlockEvaluator,
     );
 
     final planId = _uuid.v4();
@@ -290,6 +333,7 @@ class PolicyEngine {
       planResult: planResult,
       command: command,
       actor: actor,
+      adapter: adapter,
     );
 
     return planResult;
@@ -297,12 +341,19 @@ class PolicyEngine {
 
   /// Commit a previously planned execution.
   ///
-  /// Throws [StateError] if plan is not found or expired.
+  /// When the pending plan was created with an `adapter`, that adapter is
+  /// used by default. Callers may still pass an explicit [adapter]
+  /// override (e.g. wrapped/instrumented variants); when both are
+  /// available, the explicit argument wins. When neither is provided a
+  /// [StateError] is thrown.
+  ///
+  /// Throws [StateError] if plan is not found, expired, or no adapter
+  /// is available.
   Future<CommandResult> commitExecute({
     required String planId,
     required String actorId,
     String? acknowledgment,
-    required IoDevicePort adapter,
+    IoDevicePort? adapter,
   }) async {
     final pending = _pendingPlans.remove(planId);
     if (pending == null) {
@@ -322,9 +373,17 @@ class PolicyEngine {
       );
     }
 
+    final resolvedAdapter = adapter ?? pending.adapter;
+    if (resolvedAdapter == null) {
+      throw StateError(
+        'policy.adapter_unresolved: plan $planId has no adapter; supply '
+        'one to planEvaluate or commitExecute',
+      );
+    }
+
     // Execute the command
     try {
-      return await adapter.execute(pending.command);
+      return await resolvedAdapter.execute(pending.command);
     } on Object catch (error) {
       return CommandResult(
         status: CommandStatus.failed,

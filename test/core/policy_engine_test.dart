@@ -461,6 +461,264 @@ void main() {
     });
   });
 
+  group('PolicyEngine - Interlock Evaluator', () {
+    test('TC-INT-001 [normal] Evaluator triggered → deny', () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow with interlock',
+        when: PolicyCondition(action: 'write_register'),
+        allow: true,
+        constraints: PolicyConstraints(
+          interlocks: [
+            Interlock(
+              uri: 'io://dev-1/coil/1/value',
+              condition: InterlockCondition.isTrue,
+              action: InterlockAction.deny,
+            ),
+          ],
+        ),
+      ));
+      await engine.initialize();
+
+      final decision = await engine.evaluate(
+        command: const Command(
+          action: 'write_register',
+          target: 'io://dev-1/reg/holding/40010/value',
+        ),
+        actor: _actor(),
+        device: _device(),
+        interlockEvaluator: (_) async => true, // 조건 매칭
+      );
+
+      expect(decision.decision, Decision.deny);
+      expect(decision.notes, contains('Interlock blocked'));
+      expect(decision.notes, contains('isTrue'));
+    });
+
+    test('TC-INT-002 [normal] Evaluator not triggered → allow', () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow with interlock',
+        when: PolicyCondition(action: 'write_register'),
+        allow: true,
+        constraints: PolicyConstraints(
+          interlocks: [
+            Interlock(
+              uri: 'io://dev-1/coil/1/value',
+              condition: InterlockCondition.isTrue,
+              action: InterlockAction.deny,
+            ),
+          ],
+        ),
+      ));
+      await engine.initialize();
+
+      final decision = await engine.evaluate(
+        command: const Command(
+          action: 'write_register',
+          target: 'io://dev-1/reg/holding/40010/value',
+        ),
+        actor: _actor(),
+        device: _device(),
+        interlockEvaluator: (_) async => false, // 조건 미충족
+      );
+
+      expect(decision.decision, Decision.allow);
+    });
+
+    test('TC-INT-003 [legacy] No evaluator → needsApproval', () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow with interlock',
+        when: PolicyCondition(action: 'write_register'),
+        allow: true,
+        constraints: PolicyConstraints(
+          interlocks: [
+            Interlock(
+              uri: 'io://dev-1/coil/1/value',
+              condition: InterlockCondition.isTrue,
+              action: InterlockAction.deny,
+            ),
+          ],
+        ),
+      ));
+      await engine.initialize();
+
+      final decision = await engine.evaluate(
+        command: const Command(
+          action: 'write_register',
+          target: 'io://dev-1/reg/holding/40010/value',
+        ),
+        actor: _actor(),
+        device: _device(),
+        // evaluator 미주입 — legacy 동작
+      );
+
+      expect(decision.decision, Decision.needsApproval);
+      expect(decision.notes, contains('Interlock check required'));
+    });
+
+    test('TC-INT-004 [normal] Warn action 가 통과 시키되 계속 평가', () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow with warn interlock',
+        when: PolicyCondition(action: 'write_register'),
+        allow: true,
+        constraints: PolicyConstraints(
+          interlocks: [
+            Interlock(
+              uri: 'io://dev-1/coil/1/value',
+              condition: InterlockCondition.isTrue,
+              action: InterlockAction.warn,
+            ),
+          ],
+        ),
+      ));
+      await engine.initialize();
+
+      final decision = await engine.evaluate(
+        command: const Command(
+          action: 'write_register',
+          target: 'io://dev-1/reg/holding/40010/value',
+        ),
+        actor: _actor(),
+        device: _device(),
+        interlockEvaluator: (_) async => true,
+      );
+
+      expect(decision.decision, Decision.allow);
+    });
+
+    test('TC-INT-005 [normal] 다중 interlock 중 하나만 trigger 면 deny',
+        () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow with multi interlock',
+        when: PolicyCondition(action: 'write_register'),
+        allow: true,
+        constraints: PolicyConstraints(
+          interlocks: [
+            Interlock(
+              uri: 'io://dev-1/coil/1/value',
+              condition: InterlockCondition.isTrue,
+              action: InterlockAction.deny,
+            ),
+            Interlock(
+              uri: 'io://dev-1/coil/2/value',
+              condition: InterlockCondition.isTrue,
+              action: InterlockAction.deny,
+            ),
+          ],
+        ),
+      ));
+      await engine.initialize();
+
+      var callCount = 0;
+      final decision = await engine.evaluate(
+        command: const Command(
+          action: 'write_register',
+          target: 'io://dev-1/reg/holding/40010/value',
+        ),
+        actor: _actor(),
+        device: _device(),
+        interlockEvaluator: (interlock) async {
+          callCount++;
+          // 두 번째 interlock 만 trigger
+          return interlock.uri.endsWith('/coil/2/value');
+        },
+      );
+
+      expect(decision.decision, Decision.deny);
+      expect(decision.notes, contains('coil/2'));
+      // 첫 interlock 통과 후 두 번째에서 멈춤
+      expect(callCount, 2);
+    });
+  });
+
+  group('PolicyEngine - Adapter Routing (Plan/Commit)', () {
+    test('TC-ROUTE-001 [normal] PlanEvaluate 가 adapter 캡처 → CommitExecute 자동 사용',
+        () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow',
+        when: PolicyCondition(action: 'measure'),
+        allow: true,
+      ));
+      await engine.initialize();
+
+      final adapter = _StubDevicePort();
+      final plan = await engine.planEvaluate(
+        command: const Command(action: 'measure', target: 'io://dev-1/ch/1'),
+        actor: _actor(),
+        device: _device(),
+        adapter: adapter,
+      );
+
+      // adapter 안 줘도 OK — pending plan 의 것 사용
+      final result = await engine.commitExecute(
+        planId: plan.planId,
+        actorId: 'actor-1',
+      );
+
+      expect(result.status, CommandStatus.completed);
+    });
+
+    test('TC-ROUTE-002 [normal] CommitExecute 의 explicit adapter 가 override',
+        () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow',
+        when: PolicyCondition(action: 'measure'),
+        allow: true,
+      ));
+      await engine.initialize();
+
+      final original = _StubDevicePort();
+      final override = _CountingDevicePort();
+
+      final plan = await engine.planEvaluate(
+        command: const Command(action: 'measure', target: 'io://dev-1/ch/1'),
+        actor: _actor(),
+        device: _device(),
+        adapter: original,
+      );
+
+      final result = await engine.commitExecute(
+        planId: plan.planId,
+        actorId: 'actor-1',
+        adapter: override,
+      );
+
+      expect(result.status, CommandStatus.completed);
+      expect(override.executeCalls, 1);
+    });
+
+    test('TC-ROUTE-003 [error] adapter 없으면 throw', () async {
+      await ruleStore.addRule(const PolicyRule(
+        id: 'r1',
+        name: 'Allow',
+        when: PolicyCondition(action: 'measure'),
+        allow: true,
+      ));
+      await engine.initialize();
+
+      final plan = await engine.planEvaluate(
+        command: const Command(action: 'measure', target: 'io://dev-1/ch/1'),
+        actor: _actor(),
+        device: _device(),
+        // adapter 미주입
+      );
+
+      expect(
+        () => engine.commitExecute(
+          planId: plan.planId,
+          actorId: 'actor-1',
+        ),
+        throwsStateError,
+      );
+    });
+  });
+
   group('PolicyEngine - Reload & Cleanup', () {
     test('TC-041 [normal] ReloadRules updates rule cache', () async {
       await engine.initialize();
@@ -619,6 +877,35 @@ class _StubDevicePort implements IoDevicePort {
   @override
   Future<CommandResult> execute(Command command) async =>
       CommandResult(status: CommandStatus.completed);
+  @override
+  Stream<PayloadEnvelope> subscribe(TopicSpec spec) => const Stream.empty();
+  @override
+  Future<EmergencyStopResult> emergencyStop(EmergencyStopRequest request) async =>
+      const EmergencyStopResult(success: true);
+}
+
+/// Counting variant — used to verify which adapter actually executed.
+class _CountingDevicePort implements IoDevicePort {
+  int executeCalls = 0;
+
+  @override
+  Future<void> connect() async {}
+  @override
+  Future<void> disconnect() async {}
+  @override
+  Future<DeviceDescriptor> describe() async => const DeviceDescriptor(
+        deviceId: 'dev-1',
+        manufacturer: 'T',
+        model: 'M',
+        transport: 'tcp',
+      );
+  @override
+  Future<ReadResult> read(ReadSpec spec) async => const ReadResult();
+  @override
+  Future<CommandResult> execute(Command command) async {
+    executeCalls++;
+    return CommandResult(status: CommandStatus.completed);
+  }
   @override
   Stream<PayloadEnvelope> subscribe(TopicSpec spec) => const Stream.empty();
   @override

@@ -95,8 +95,9 @@ void main() {
   // TC-174~175: Tool registration
   // ---------------------------------------------------------------------------
   group('IoTools - Tool Registration', () {
-    test('TC-174 [normal] tools list has 8 entries', () {
-      expect(tools.tools, hasLength(8));
+    test('TC-174 [normal] tools list has 11 entries', () {
+      // 8 base tools + 3 job tools (cancel_job/list_jobs/get_job, FR-011)
+      expect(tools.tools, hasLength(11));
     });
 
     test('TC-175 [normal] tool names match expected set', () {
@@ -112,6 +113,9 @@ void main() {
           'io.subscribe',
           'io.plan_execute',
           'io.commit_execute',
+          'io.cancel_job',
+          'io.list_jobs',
+          'io.get_job',
         ]),
       );
     });

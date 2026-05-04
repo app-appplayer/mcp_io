@@ -119,6 +119,37 @@ class IoTools {
             'required': ['planId', 'actorId'],
           },
         ),
+        const ToolInfo(
+          name: 'io.cancel_job',
+          description: 'Cooperatively cancel a long-running job.',
+          inputSchema: {
+            'type': 'object',
+            'properties': {
+              'jobId': {'type': 'string'},
+              'cancelledBy': {'type': 'string'},
+            },
+            'required': ['jobId'],
+          },
+        ),
+        const ToolInfo(
+          name: 'io.list_jobs',
+          description: 'List active and recently retained jobs.',
+          inputSchema: {
+            'type': 'object',
+            'properties': <String, Object>{},
+          },
+        ),
+        const ToolInfo(
+          name: 'io.get_job',
+          description: 'Get a job snapshot by id.',
+          inputSchema: {
+            'type': 'object',
+            'properties': {
+              'jobId': {'type': 'string'},
+            },
+            'required': ['jobId'],
+          },
+        ),
       ];
 
   /// Dispatch a tool call by name.
@@ -140,6 +171,12 @@ class IoTools {
         return planExecute(args);
       case 'io.commit_execute':
         return commitExecute(args);
+      case 'io.cancel_job':
+        return cancelJob(args);
+      case 'io.list_jobs':
+        return listJobs(args);
+      case 'io.get_job':
+        return getJob(args);
       default:
         return ToolResult.error('tool.not_found: unknown tool $toolName');
     }
@@ -291,10 +328,19 @@ class IoTools {
         return ToolResult.error('device.not_found: $target');
       }
 
+      // Resolve the adapter at plan time and capture it in the pending
+      // plan so that commitExecute can route to the same adapter without
+      // the caller re-resolving.
+      final adapter = await _runtime.registry.resolveAdapter(target);
+      if (adapter == null) {
+        return ToolResult.error('adapter.not_found: $target');
+      }
+
       final plan = await _runtime.policyEngine.planEvaluate(
         command: command,
         actor: actor,
         device: device,
+        adapter: adapter,
       );
       return ToolResult.success(jsonEncode(plan.toJson()));
     } on Object catch (error) {
@@ -314,23 +360,62 @@ class IoTools {
     }
 
     try {
-      // Resolve adapter for the planned command
-      // The plan stores the command internally, so we need the adapter
       final acknowledgment = args['acknowledgment'] as String?;
 
-      // For commit, we need an adapter — resolve from the plan's target
-      // PolicyEngine.commitExecute handles this via the adapter parameter
-      // We pass a placeholder; the actual implementation should store
-      // the adapter reference in the pending plan
+      // Adapter was captured during planExecute and is reused here, so
+      // the caller never needs to re-resolve it.
       final result = await _runtime.policyEngine.commitExecute(
         planId: planId,
         actorId: actorId,
         acknowledgment: acknowledgment,
-        adapter: _AdapterPlaceholder(),
       );
       return ToolResult.success(jsonEncode(result.toJson()));
     } on StateError catch (error) {
       return ToolResult.error(error.message);
+    } on Object catch (error) {
+      return ToolResult.error('$error');
+    }
+  }
+
+  /// io.cancel_job — Cooperatively cancel a long-running job.
+  Future<ToolResult> cancelJob(Map<String, dynamic> args) async {
+    final jobId = args['jobId'] as String?;
+    if (jobId == null) {
+      return ToolResult.error('tool.invalid_args: jobId is required');
+    }
+    try {
+      final ok = _runtime.cancelJob(
+        jobId,
+        cancelledBy: args['cancelledBy'] as String?,
+      );
+      return ToolResult.success(jsonEncode({'cancelled': ok, 'jobId': jobId}));
+    } on Object catch (error) {
+      return ToolResult.error('$error');
+    }
+  }
+
+  /// io.list_jobs — List active and recently retained jobs.
+  Future<ToolResult> listJobs(Map<String, dynamic> args) async {
+    try {
+      final jobs = _runtime.jobs().map((j) => j.toJson()).toList();
+      return ToolResult.success(jsonEncode(jobs));
+    } on Object catch (error) {
+      return ToolResult.error('$error');
+    }
+  }
+
+  /// io.get_job — Get a single job snapshot by id.
+  Future<ToolResult> getJob(Map<String, dynamic> args) async {
+    final jobId = args['jobId'] as String?;
+    if (jobId == null) {
+      return ToolResult.error('tool.invalid_args: jobId is required');
+    }
+    try {
+      final snapshot = _runtime.job(jobId);
+      if (snapshot == null) {
+        return ToolResult.error('job.not_found: $jobId');
+      }
+      return ToolResult.success(jsonEncode(snapshot.toJson()));
     } on Object catch (error) {
       return ToolResult.error('$error');
     }
@@ -350,33 +435,3 @@ class IoTools {
   }
 }
 
-/// Placeholder adapter used when the actual adapter resolution
-/// needs to happen inside commitExecute. In a full implementation,
-/// the pending plan stores the adapter reference.
-class _AdapterPlaceholder implements IoDevicePort {
-  @override
-  Future<void> connect() async {}
-
-  @override
-  Future<void> disconnect() async {}
-
-  @override
-  Future<DeviceDescriptor> describe() async =>
-      throw UnsupportedError('Placeholder adapter');
-
-  @override
-  Future<ReadResult> read(ReadSpec spec) async =>
-      throw UnsupportedError('Placeholder adapter');
-
-  @override
-  Future<CommandResult> execute(Command command) async =>
-      throw UnsupportedError('Placeholder adapter');
-
-  @override
-  Stream<PayloadEnvelope> subscribe(TopicSpec spec) =>
-      throw UnsupportedError('Placeholder adapter');
-
-  @override
-  Future<EmergencyStopResult> emergencyStop(EmergencyStopRequest request) async =>
-      throw UnsupportedError('Placeholder adapter');
-}

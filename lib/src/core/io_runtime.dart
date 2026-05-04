@@ -4,9 +4,12 @@ import 'package:mcp_bundle/mcp_bundle.dart' hide PolicyRule, PolicyCondition;
 
 import '../models/actor_context.dart';
 import '../models/configs.dart';
+import '../models/job.dart';
 import 'audit_trail.dart';
 import 'command_queue.dart';
 import 'device_registry.dart';
+import 'io_metrics.dart';
+import 'job_manager.dart';
 import 'policy_engine.dart';
 import 'session_manager.dart';
 import 'stream_manager.dart';
@@ -20,6 +23,7 @@ class IoRuntimeConfig {
     this.commandQueue = const CommandQueueConfig.defaults(),
     this.session = const SessionConfig.defaults(),
     this.reconnection = const ReconnectionConfig.defaults(),
+    this.jobs = const JobManagerConfig.defaults(),
   });
 
   const IoRuntimeConfig.defaults() : this();
@@ -30,6 +34,7 @@ class IoRuntimeConfig {
   final CommandQueueConfig commandQueue;
   final SessionConfig session;
   final ReconnectionConfig reconnection;
+  final JobManagerConfig jobs;
 }
 
 /// Central I/O runtime orchestrator.
@@ -42,7 +47,9 @@ class IoRuntime {
     IoRuntimeConfig? config,
     required IoPolicyPort policyPort,
     required IoAuditPort auditPort,
-  }) : config = config ?? const IoRuntimeConfig.defaults() {
+    IoMetrics? metrics,
+  })  : config = config ?? const IoRuntimeConfig.defaults(),
+        _metrics = metrics ?? const NoopIoMetrics() {
     _registry = DeviceRegistry(
       config: this.config.registry,
       reconnectionConfig: this.config.reconnection,
@@ -69,6 +76,8 @@ class IoRuntime {
       config: this.config.session,
       onSessionClosed: _onSessionClosed,
     );
+
+    _jobManager = JobManager(config: this.config.jobs);
   }
 
   final IoRuntimeConfig config;
@@ -79,6 +88,9 @@ class IoRuntime {
   late final StreamManager _streamManager;
   late final CommandQueue _commandQueue;
   late final SessionManager _sessionManager;
+  late final JobManager _jobManager;
+
+  final IoMetrics _metrics;
 
   /// Access the device registry for adapter/device management.
   DeviceRegistry get registry => _registry;
@@ -94,6 +106,13 @@ class IoRuntime {
 
   /// Access the session manager for session management.
   SessionManager get sessionManager => _sessionManager;
+
+  /// Access the job manager for long-running job lifecycle.
+  JobManager get jobManager => _jobManager;
+
+  /// Access the metrics sink. Hosts inject their own [IoMetrics]
+  /// implementation in the constructor; default is [NoopIoMetrics].
+  IoMetrics get metrics => _metrics;
 
   /// Initialize runtime and all core modules.
   Future<void> initialize() async {
@@ -127,6 +146,8 @@ class IoRuntime {
     ActorContext? actor,
   }) async {
     final items = <ReadResultItem>[];
+    _metrics.incrementCounter('io.request.count',
+        labels: {'op': 'read', 'targets': spec.targets.length});
 
     for (final target in spec.targets) {
       try {
@@ -140,11 +161,20 @@ class IoRuntime {
               timestamp: DateTime.now(),
             ),
           ));
+          _metrics.incrementCounter('io.request.error.count',
+              labels: {'op': 'read', 'code': 'device.not_found'});
           continue;
         }
 
-        final result = await adapter.read(ReadSpec(targets: [target], options: spec.options));
+        final result = await adapter
+            .read(ReadSpec(targets: [target], options: spec.options));
         items.addAll(result.items);
+        for (final item in result.items) {
+          if (item.error != null) {
+            _metrics.incrementCounter('io.request.error.count',
+                labels: {'op': 'read', 'code': item.error!.code});
+          }
+        }
       } on Object catch (error) {
         items.add(ReadResultItem(
           uri: target,
@@ -154,6 +184,8 @@ class IoRuntime {
             timestamp: DateTime.now(),
           ),
         ));
+        _metrics.incrementCounter('io.request.error.count',
+            labels: {'op': 'read', 'code': 'exec.failed'});
       }
     }
 
@@ -169,12 +201,16 @@ class IoRuntime {
     required ActorContext actor,
   }) async {
     final now = DateTime.now();
+    _metrics.incrementCounter('io.request.count',
+        labels: {'op': 'execute', 'action': command.action});
 
     // Resolve device descriptor for policy evaluation
     final deviceId = _extractDeviceId(command.target);
     final device = deviceId != null ? await _registry.get(deviceId) : null;
 
     if (device == null) {
+      _metrics.incrementCounter('io.request.error.count',
+          labels: {'op': 'execute', 'code': 'device.not_found'});
       return CommandResult(
         status: CommandStatus.failed,
         error: IoError(
@@ -185,12 +221,15 @@ class IoRuntime {
       );
     }
 
-    // Policy evaluation
+    // Policy evaluation with live interlock evaluator.
     final decision = await _policyEngine.evaluate(
       command: command,
       actor: actor,
       device: device,
+      interlockEvaluator: _evaluateInterlock,
     );
+    _metrics.incrementCounter('io.policy.decision.count',
+        labels: {'decision': decision.decision.name});
 
     // Record audit
     await _auditTrail.record(IoAuditRecord(
@@ -253,6 +292,8 @@ class IoRuntime {
     EmergencyStopRequest request,
   ) async {
     final now = DateTime.now();
+    _metrics.incrementCounter('io.estop.count',
+        labels: {'scope': request.deviceId == null ? 'all' : 'single'});
 
     try {
       EmergencyStopResult result;
@@ -343,7 +384,7 @@ class IoRuntime {
       );
     }
 
-    // Capture state before execution (FR-005-04)
+    // Capture state before execution.
     Map<String, dynamic>? stateBefore;
     try {
       final desc = await adapter.describe();
@@ -357,7 +398,7 @@ class IoRuntime {
 
     final result = await adapter.execute(command);
 
-    // Capture state after execution (FR-005-04)
+    // Capture state after execution.
     Map<String, dynamic>? stateAfter;
     try {
       final desc = await adapter.describe();
@@ -395,6 +436,52 @@ class IoRuntime {
     await _commandQueue.drainDevice(deviceId);
   }
 
+  /// Live interlock evaluator. Reads the interlock URI through the
+  /// resolved adapter and applies the configured condition operator.
+  /// Returns `true` when the interlock condition is satisfied (action
+  /// should be applied — typically deny).
+  Future<bool> _evaluateInterlock(Interlock interlock) async {
+    try {
+      final adapter = await _registry.resolveAdapter(interlock.uri);
+      if (adapter == null) {
+        // Adapter unresolved → fail-safe: treat as triggered so caller
+        // sees a deny instead of silently passing.
+        return true;
+      }
+      final result = await adapter.read(ReadSpec(targets: [interlock.uri]));
+      if (result.items.isEmpty || result.items.first.error != null) {
+        return true;
+      }
+      final envelope = result.items.first.envelope;
+      if (envelope == null) return true;
+      return _matchInterlockCondition(envelope.payload.value, interlock.condition);
+    } on Object {
+      // Read failure → fail-safe deny.
+      return true;
+    }
+  }
+
+  /// Apply an [InterlockCondition] operator to a live value.
+  ///
+  /// v1 supports `isTrue` / `isFalse` for boolean interlocks (the
+  /// dominant industrial use case — E-Stop coil, safety relay, ...).
+  /// `equals` / `greaterThan` / `lessThan` require an expected operand
+  /// that is not part of the current spec; they are deferred to v1.x.
+  bool _matchInterlockCondition(Object? value, InterlockCondition condition) {
+    switch (condition) {
+      case InterlockCondition.isTrue:
+        return value == true;
+      case InterlockCondition.isFalse:
+        return value == false;
+      case InterlockCondition.equals:
+      case InterlockCondition.greaterThan:
+      case InterlockCondition.lessThan:
+        // Operand-less operators: treat as not-triggered for now and
+        // surface a notes hint via PolicyDecision in a future revision.
+        return false;
+    }
+  }
+
   /// Extract deviceId from a target URI or path.
   String? _extractDeviceId(String target) {
     // Handle io://<deviceId>/... format
@@ -411,6 +498,22 @@ class IoRuntime {
     return target.substring(0, slashIndex);
   }
 
+  /// Cancel a long-running job by id. Returns true when the
+  /// cancellation was delivered. The runner is responsible for actually
+  /// stopping cooperatively.
+  bool cancelJob(String jobId, {String? cancelledBy}) {
+    final ok = _jobManager.cancel(jobId, cancelledBy: cancelledBy);
+    _metrics.incrementCounter('io.job.cancel.count',
+        labels: {'delivered': ok});
+    return ok;
+  }
+
+  /// Snapshot of a job, or null when unknown.
+  Job? job(String jobId) => _jobManager.get(jobId);
+
+  /// All known jobs, sorted by start time desc.
+  List<Job> jobs() => _jobManager.list();
+
   /// Dispose all resources.
   Future<void> dispose() async {
     await shutdown();
@@ -418,6 +521,7 @@ class IoRuntime {
     await _streamManager.dispose();
     await _commandQueue.dispose();
     await _sessionManager.dispose();
+    await _jobManager.dispose();
     await _registry.dispose();
   }
 }

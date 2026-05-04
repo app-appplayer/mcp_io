@@ -8,6 +8,7 @@ library mcp_io;
 // Models
 export 'src/models/actor_context.dart';
 export 'src/models/configs.dart';
+export 'src/models/job.dart';
 export 'src/models/plan_result.dart';
 export 'src/models/session_info.dart';
 
@@ -18,6 +19,8 @@ export 'src/core/audit_trail.dart';
 export 'src/core/stream_manager.dart';
 export 'src/core/command_queue.dart';
 export 'src/core/session_manager.dart';
+export 'src/core/job_manager.dart';
+export 'src/core/io_metrics.dart';
 export 'src/core/io_runtime.dart';
 
 // Adapters

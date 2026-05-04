@@ -5,6 +5,8 @@ import 'package:mcp_bundle/mcp_bundle.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/configs.dart';
+import '../models/job.dart';
+import 'job_manager.dart';
 
 /// Internal ring buffer for backpressure management.
 class RingBuffer<T> {
@@ -346,21 +348,26 @@ class StreamManager implements IoStreamPort {
   StreamManager({
     required this.config,
     AdapterResolver? adapterResolver,
+    JobManager? jobManager,
     DateTime Function()? clock,
   })  : _adapterResolver = adapterResolver,
+        _jobManager = jobManager,
         _clock = clock ?? DateTime.now;
 
   /// Factory: create with default configuration.
   factory StreamManager.withDefaults({
     AdapterResolver? adapterResolver,
+    JobManager? jobManager,
   }) =>
       StreamManager(
         config: const StreamingConfig.defaults(),
         adapterResolver: adapterResolver,
+        jobManager: jobManager,
       );
 
   final StreamingConfig config;
   final AdapterResolver? _adapterResolver;
+  final JobManager? _jobManager;
   final DateTime Function() _clock;
   final Map<String, _SubscriptionEntry> _subscriptions = {};
   final Uuid _uuid = const Uuid();
@@ -457,8 +464,25 @@ class StreamManager implements IoStreamPort {
     _memory.allocate(estimatedBytes);
     _subscriptions[subscriptionId] = entry;
 
-    // Resolve adapter and subscribe to source stream
-    if (_adapterResolver != null) {
+    // Resolve source — first check job-progress URI pattern
+    // (`io://<dev>/job/<jobId>/progress`), then fall back to the
+    // adapter resolver. Job source takes precedence so an adapter
+    // can't shadow the job stream.
+    final jobMatch = _matchJobProgressUri(spec.uri);
+    if (jobMatch != null && _jobManager != null) {
+      try {
+        final jobStream = _jobManager.progress(jobMatch.jobId);
+        entry.sourceSubscription = jobStream
+            .map((job) => _jobToEnvelope(spec.uri, job))
+            .listen(
+          (envelope) => _onData(envelope, entry),
+          onError: (Object error) => _onSourceError(error, entry),
+          onDone: () => _onSourceDone(entry),
+        );
+      } on Object {
+        // Best-effort — entry stays without a source.
+      }
+    } else if (_adapterResolver != null) {
       try {
         final adapter = await _adapterResolver(spec.uri);
         if (adapter != null) {
@@ -540,7 +564,7 @@ class StreamManager implements IoStreamPort {
   void _onData(PayloadEnvelope envelope, _SubscriptionEntry entry) {
     if (!entry.active) return;
 
-    // Apply downsampling if configured (FR-004-04)
+    // Apply downsampling if configured.
     final effectiveEnvelope = _applyDownsampling(envelope, entry);
 
     if (entry.buffer.isFull) {
@@ -671,4 +695,42 @@ class StreamManager implements IoStreamPort {
   Future<void> dispose() async {
     await closeAll();
   }
+
+  // === Job progress URI routing ===
+
+  /// Match `io://<deviceId>/job/<jobId>/progress`. Returns `null` for
+  /// any URI that is not a job-progress topic.
+  _JobProgressUriMatch? _matchJobProgressUri(String uri) {
+    final m = RegExp(r'^io://([^/]+)/job/([^/]+)/progress$').firstMatch(uri);
+    if (m == null) return null;
+    return _JobProgressUriMatch(
+      deviceId: m.group(1)!,
+      jobId: m.group(2)!,
+    );
+  }
+
+  /// Wrap a [Job] snapshot into a `PayloadEnvelope` for delivery
+  /// through the standard subscription path.
+  PayloadEnvelope _jobToEnvelope(String uri, Job job) {
+    final now = _clock();
+    return PayloadEnvelope(
+      uri: uri,
+      kind: PayloadKind.event,
+      payload: TypedPayload(
+        type: PayloadType.event,
+        value: job.toJson(),
+        timestamp: now,
+      ),
+      meta: EnvelopeMeta(
+        capturedAt: now,
+        sourceAddress: 'job://${job.jobId}',
+      ),
+    );
+  }
+}
+
+class _JobProgressUriMatch {
+  const _JobProgressUriMatch({required this.deviceId, required this.jobId});
+  final String deviceId;
+  final String jobId;
 }

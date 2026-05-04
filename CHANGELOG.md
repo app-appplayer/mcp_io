@@ -1,3 +1,10 @@
+## [0.2.0] - 2026-05-04
+
+- Long-running job lifecycle (`JobManager` + cooperative cancellation +
+  progress URI subscribe).
+- Runtime telemetry hooks (`IoMetrics` counter / gauge interface).
+- MCP tool surface expanded to 11 tools (3 job-control tools added).
+
 ## [0.1.0] - 2026-04-28 - Initial Release
 
 ### Added
