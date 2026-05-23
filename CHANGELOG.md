@@ -1,3 +1,8 @@
+## [0.2.1] - 2026-05-23 - mcp_bundle 0.4.0 cascade
+
+### Changed (cascade)
+- `mcp_bundle` caret bumped from `^0.3.0` to `^0.4.0`. mcp_io does not touch `UiSection.pages` directly, so this release is a caret-only cascade. Consumers should bump to `^0.2.1`.
+
 ## [0.2.0] - 2026-05-04
 
 - Long-running job lifecycle (`JobManager` + cooperative cancellation +
