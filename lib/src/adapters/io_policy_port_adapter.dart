@@ -3,7 +3,7 @@
 /// Provides a fully functional rule store for PolicyEngine.
 library;
 
-import 'package:mcp_bundle/src/ports/io_policy_port.dart';
+import 'package:mcp_bundle/ports.dart';
 
 /// In-memory implementation of [IoPolicyPort].
 ///

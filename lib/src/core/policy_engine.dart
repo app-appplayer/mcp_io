@@ -1,11 +1,10 @@
 import 'dart:async';
 
 import 'package:mcp_bundle/mcp_bundle.dart' hide PolicyRule, PolicyCondition;
-// PolicyRule and PolicyCondition from io_policy_port conflict with
-// names in models/policy.dart. Hide from barrel and import directly.
-// ignore: implementation_imports
-import 'package:mcp_bundle/src/ports/io_policy_port.dart'
-    show PolicyRule, PolicyCondition;
+// PolicyRule / PolicyCondition from io_policy_port conflict with names in
+// models/policy.dart, so the main barrel hides them and they are taken from
+// the public ports catalogue with an explicit `show`.
+import 'package:mcp_bundle/ports.dart' show PolicyRule, PolicyCondition;
 import 'package:uuid/uuid.dart';
 
 import '../models/actor_context.dart';

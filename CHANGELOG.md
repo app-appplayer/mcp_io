@@ -1,3 +1,13 @@
+## [0.2.2] - 2026-06-25 - Import hygiene — use the public ports catalogue
+
+### Changed
+- `policy_engine.dart` and `io_policy_port_adapter.dart` now import the io
+  policy contract via the public `package:mcp_bundle/ports.dart` instead of
+  reaching into `package:mcp_bundle/src/ports/io_policy_port.dart` (an
+  implementation import). The io `PolicyRule` / `PolicyCondition` names are
+  taken with an explicit `show`, so the models/policy `PolicyRule` stays
+  disambiguated. No API or behaviour change.
+
 ## [0.2.1] - 2026-05-23 - mcp_bundle 0.4.0 cascade
 
 ### Changed (cascade)
